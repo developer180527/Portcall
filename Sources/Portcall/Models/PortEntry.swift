@@ -7,7 +7,7 @@ enum NetworkProtocol: String, Hashable, Sendable {
 }
 
 /// How reachable a listening socket is, derived from its bound address.
-enum Exposure: Sendable {
+enum Exposure: Sendable, Hashable {
     /// Bound to loopback only (127.0.0.0/8 or ::1). Not reachable off-host.
     case localhost
     /// Bound to a specific non-loopback interface address (e.g. a LAN IP).
@@ -28,16 +28,18 @@ enum Exposure: Sendable {
 struct PortEntry: Identifiable, Hashable, Sendable {
     let pid: Int32
     let command: String
-    let user: String
     let proto: NetworkProtocol
-    /// "IPv4" or "IPv6" as reported by lsof.
+    /// "IPv4" or "IPv6".
     let family: String
-    /// Host portion of the bound address (e.g. "127.0.0.1", "*", "::1").
+    /// Host portion of the bound address (e.g. "127.0.0.1", "0.0.0.0", "::1").
     let address: String
     let port: Int
 
     /// Stable identity across scans so SwiftUI can diff the list smoothly.
     var id: String { "\(pid)-\(proto.rawValue)-\(family)-\(address)-\(port)" }
+
+    /// Key for matching against ContainerCollector's map, e.g. "tcp:6881".
+    var containerKey: String { "\(proto.rawValue.lowercased()):\(port)" }
 
     var exposure: Exposure {
         switch address {

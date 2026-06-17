@@ -1,109 +1,74 @@
 import Foundation
+import Darwin
 
-/// Collects listening TCP/UDP sockets by invoking `lsof` in field-output mode
-/// and normalizing the result into `PortEntry` values.
-///
-/// Phase 1 shells out to `/usr/sbin/lsof`. A later phase will replace this with
-/// `libproc`/`proc_pidinfo` for lower overhead and to drop the external process.
+/// Enumerates listening TCP/UDP sockets directly via libproc (no subprocess).
+/// Walks every PID's socket file descriptors and keeps TCP sockets in LISTEN
+/// state plus bound, unconnected UDP sockets.
 struct PortScanner: Sendable {
-    private let lsofPath = "/usr/sbin/lsof"
-
-    /// Run a full scan: TCP listeners + bound (unconnected) UDP sockets.
     func scan() -> [PortEntry] {
-        var entries: [PortEntry] = []
-        // -n: no DNS, -P: no port-name lookup -> fast and stable to parse.
-        entries += parse(Shell.run(lsofPath, ["-nP", "-iTCP", "-sTCP:LISTEN", "-FpcLPtnT"]),
-                         defaultProtocol: .tcp)
-        entries += parse(Shell.run(lsofPath, ["-nP", "-iUDP", "-FpcLPtnT"]),
-                         defaultProtocol: .udp)
-        return entries
-    }
-
-    // MARK: - Field-output parsing
-
-    /// Parse lsof `-F` output. Process-level fields (`p`,`c`,`L`) appear once,
-    /// then file-level fields (`f`,`t`,`P`,`n`,`T`) repeat per open socket.
-    private func parse(_ output: String, defaultProtocol: NetworkProtocol) -> [PortEntry] {
         var results: [PortEntry] = []
-
-        var pid: Int32 = 0
-        var command = ""
-        var user = ""
-
-        var family = ""
-        var proto: NetworkProtocol?
-        var name = ""
-        var isListening = false
-        var inFile = false
-
-        func flush() {
-            defer {
-                inFile = false
-                family = ""; proto = nil; name = ""; isListening = false
-            }
-            guard inFile, !name.isEmpty else { return }
-            // Skip connected sockets (e.g. active UDP flows "src->dst").
-            guard !name.contains("->") else { return }
-            guard let (address, port) = splitHostPort(name) else { return }
-            // TCP rows are already filtered to LISTEN by lsof; UDP has no state.
-            if defaultProtocol == .tcp && !isListening { return }
-            results.append(
-                PortEntry(
-                    pid: pid,
-                    command: command,
-                    user: user,
-                    proto: proto ?? defaultProtocol,
-                    family: family.isEmpty ? "IPv4" : family,
-                    address: address,
-                    port: port
-                )
-            )
-        }
-
-        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let tag = rawLine.first else { continue }
-            let value = String(rawLine.dropFirst())
-            switch tag {
-            case "p":
-                flush()
-                pid = Int32(value) ?? 0
-            case "c":
-                command = value
-            case "L":
-                user = value
-            case "f":
-                flush()
-                inFile = true
-            case "t":
-                family = value
-            case "P":
-                proto = NetworkProtocol(rawValue: value)
-            case "n":
-                name = value
-            case "T":
-                if value.hasPrefix("ST=") {
-                    isListening = value.dropFirst(3) == "LISTEN"
+        for pid in Libproc.allPIDs() where pid > 0 {
+            let fds = Libproc.socketFDs(of: pid)
+            guard !fds.isEmpty else { continue }
+            let command = Libproc.name(of: pid)
+            for fd in fds {
+                if let entry = entry(pid: pid, command: command, fd: fd) {
+                    results.append(entry)
                 }
-            default:
-                break
             }
         }
-        flush()
         return results
     }
 
-    /// Split an lsof address into (host, port). Handles `*:53`, `127.0.0.1:8080`,
-    /// `[::1]:8080`, and bracketless IPv6 like `fe80::1:53`.
-    private func splitHostPort(_ name: String) -> (String, Int)? {
-        if name.hasPrefix("["), let close = name.firstIndex(of: "]") {
-            let host = String(name[name.index(after: name.startIndex)..<close])
-            let rest = name[name.index(after: close)...] // ":port"
-            guard rest.hasPrefix(":"), let port = Int(rest.dropFirst()) else { return nil }
-            return (host, port)
+    private func entry(pid: pid_t, command: String, fd: Int32) -> PortEntry? {
+        var info = socket_fdinfo()
+        let size = Int32(MemoryLayout<socket_fdinfo>.stride)
+        guard proc_pidfdinfo(pid, fd, PROC_PIDFDSOCKETINFO, &info, size) > 0 else { return nil }
+        let socket = info.psi
+
+        let proto: NetworkProtocol
+        let ini: in_sockinfo
+        switch Int(socket.soi_kind) {
+        case SOCKINFO_TCP:
+            let tcp = socket.soi_proto.pri_tcp
+            guard tcp.tcpsi_state == Int32(TSI_S_LISTEN) else { return nil }
+            proto = .tcp
+            ini = tcp.tcpsi_ini
+        case SOCKINFO_IN where socket.soi_protocol == IPPROTO_UDP:
+            let udp = socket.soi_proto.pri_in
+            guard udp.insi_fport == 0 else { return nil } // skip connected flows
+            proto = .udp
+            ini = udp
+        default:
+            return nil
         }
-        guard let colon = name.lastIndex(of: ":") else { return nil }
-        let host = String(name[..<colon])
-        guard let port = Int(name[name.index(after: colon)...]) else { return nil }
-        return (host.isEmpty ? "*" : host, port)
+
+        let port = Self.hostPort(ini.insi_lport)
+        guard port != 0 else { return nil } // skip unbound (ephemeral) sockets
+        let (family, address) = Self.localAddress(ini)
+        return PortEntry(pid: pid, command: command, proto: proto,
+                         family: family, address: address, port: port)
+    }
+
+    // MARK: - Byte / address decoding
+
+    /// insi_lport carries the port in network byte order in its low 16 bits.
+    static func hostPort(_ networkOrder: Int32) -> Int {
+        Int(UInt16(bigEndian: UInt16(truncatingIfNeeded: networkOrder)))
+    }
+
+    /// Decode the local address into (family, presentation string), choosing the
+    /// IPv4/IPv6 union member from the socket's version flag.
+    static func localAddress(_ ini: in_sockinfo) -> (family: String, address: String) {
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        if ini.insi_vflag & 0x1 != 0 { // INI_IPV4
+            var addr = ini.insi_laddr.ina_46.i46a_addr4
+            inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
+            return ("IPv4", String(cString: buffer))
+        } else {
+            var addr = ini.insi_laddr.ina_6
+            inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
+            return ("IPv6", String(cString: buffer))
+        }
     }
 }

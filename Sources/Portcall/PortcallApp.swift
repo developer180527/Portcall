@@ -10,15 +10,21 @@ enum Main {
             let entries = PortScanner().scan().sorted {
                 $0.port != $1.port ? $0.port < $1.port : $0.proto.rawValue < $1.proto.rawValue
             }
-            let stats = ProcessInfoCollector().collect(pids: Set(entries.map(\.pid)))
+            // Single-shot: memory + path only. Live %CPU needs two samples and
+            // is computed by the running app, not this one-off dump.
+            let samples = ProcessInfoCollector().sample(pids: Set(entries.map(\.pid)))
+            let containers = ContainerCollector().collect()
             for e in entries {
-                let s = stats[e.pid]
-                let cpu = s.map { String(format: "%.1f%%", $0.cpuPercent) } ?? "—"
-                let mem = s?.memoryDisplay ?? "—"
+                let s = samples[e.pid]
+                let mem = s.map { ByteCountFormatter.string(fromByteCount: Int64($0.memoryBytes), countStyle: .memory) } ?? "—"
                 let path = s?.executablePath ?? "—"
-                print("\(e.proto.rawValue)\t\(e.displayAddress):\(e.port)\t\(e.command) (\(e.pid))\t\(e.exposure)\tCPU \(cpu)\t\(mem)\t\(path)")
+                let container = containers[e.containerKey].map { " [📦 \($0.name)]" } ?? ""
+                print("\(e.proto.rawValue)\t\(e.displayAddress):\(e.port)\t\(e.command) (\(e.pid))\t\(e.exposure)\t\(mem)\t\(path)\(container)")
             }
-            print("— \(entries.count) listening, \(entries.filter { $0.exposure.isExposed }.count) exposed")
+            let services = ServiceRow.grouped(from: entries)
+            let exposed = services.filter { $0.exposure.isExposed }.count
+            let containerized = services.filter { containers[$0.containerKey] != nil }.count
+            print("— \(entries.count) sockets → \(services.count) services, \(exposed) exposed, \(containerized) in containers")
             return
         }
         PortcallApp.main()
@@ -27,12 +33,20 @@ enum Main {
 
 struct PortcallApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var store = PortStore()
+    @StateObject private var settings: AppSettings
+    @StateObject private var store: PortStore
+
+    init() {
+        let settings = AppSettings()
+        _settings = StateObject(wrappedValue: settings)
+        _store = StateObject(wrappedValue: PortStore(settings: settings))
+    }
 
     var body: some Scene {
         MenuBarExtra {
             MenuContentView()
                 .environmentObject(store)
+                .environmentObject(settings)
                 .onAppear { store.start() }
         } label: {
             // Icon + live count of listening services.
@@ -40,6 +54,10 @@ struct PortcallApp: App {
             Text("\(store.listeningCount)")
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(settings: settings)
+        }
     }
 }
 

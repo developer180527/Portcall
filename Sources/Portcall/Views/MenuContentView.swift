@@ -4,6 +4,8 @@ import AppKit
 /// The dropdown shown when the menu bar icon is clicked.
 struct MenuContentView: View {
     @EnvironmentObject var store: PortStore
+    @EnvironmentObject var settings: AppSettings
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,10 +37,16 @@ struct MenuContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if store.containerizedCount > 0 {
+                    Label("\(store.containerizedCount) in containers",
+                          systemImage: "shippingbox.fill")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
             }
             Spacer()
             Button {
-                Task { await store.refresh() }
+                Task { await store.refresh(forceContainers: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -71,8 +79,8 @@ struct MenuContentView: View {
 
     @ViewBuilder
     private var listBody: some View {
-        let entries = store.filteredEntries
-        if entries.isEmpty {
+        let services = store.filteredServices
+        if services.isEmpty {
             VStack(spacing: 6) {
                 Image(systemName: store.searchText.isEmpty ? "checkmark.shield" : "magnifyingglass")
                     .font(.largeTitle)
@@ -84,8 +92,11 @@ struct MenuContentView: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(entries) { entry in
-                        PortRow(entry: entry, stats: store.processStats[entry.pid])
+                    ForEach(services) { service in
+                        PortRow(service: service,
+                                stats: store.processStats[service.pid],
+                                container: store.container(for: service),
+                                cpuPerCore: settings.cpuPerCore)
                         Divider()
                     }
                 }
@@ -94,15 +105,28 @@ struct MenuContentView: View {
     }
 
     private var footer: some View {
-        HStack {
-            Text("Scans every \(Int(store.refreshInterval))s")
+        HStack(spacing: 14) {
+            Text("Scans every \(Int(settings.refreshInterval))s")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Quit") { NSApp.terminate(nil) }
-                .buttonStyle(.borderless)
-                .keyboardShortcut("q")
+            Button {
+                openSettings()
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.borderless)
+            .help("Portcall Settings")
+
+            Button { NSApp.terminate(nil) } label: {
+                Image(systemName: "power")
+            }
+            .buttonStyle(.borderless)
+            .help("Quit Portcall")
+            .keyboardShortcut("q")
         }
+        .font(.body)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
@@ -110,39 +134,56 @@ struct MenuContentView: View {
 
 /// One row in the services list, with a context menu of quick actions.
 private struct PortRow: View {
-    let entry: PortEntry
+    let service: ServiceRow
     let stats: ProcessStats?
+    let container: ContainerInfo?
+    let cpuPerCore: Bool
 
     var body: some View {
         HStack(spacing: 10) {
             exposureBadge
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(entry.command)
+                    Text(service.command)
                         .fontWeight(.medium)
                         .lineLimit(1)
-                    Text("PID \(entry.pid)")
+                    Text("PID \(service.pid)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                Text("\(entry.displayAddress):\(entry.port)")
+                Text(service.displayAddress)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .help(service.families.joined(separator: " · "))
+                if let container {
+                    Label(container.name, systemImage: "shippingbox.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                        .lineLimit(1)
+                        .help("Image: \(container.image)")
+                }
                 if let stats, stats.hasUsage {
-                    Text("CPU \(stats.cpuDisplay) · \(stats.memoryDisplay)")
+                    Text("CPU \(stats.cpuDisplay(perCore: cpuPerCore)) · \(stats.memoryDisplay)")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text(entry.proto.rawValue)
-                    .font(.caption2.monospaced())
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary, in: Capsule())
-                Text(":\(entry.port)")
+                HStack(spacing: 4) {
+                    if service.isDualStack {
+                        Text("v4·v6")
+                            .font(.system(size: 9).monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(service.proto.rawValue)
+                        .font(.caption2.monospaced())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+                Text(":\(service.port)")
                     .font(.callout.monospaced())
             }
         }
@@ -150,15 +191,15 @@ private struct PortRow: View {
         .padding(.vertical, 7)
         .contentShape(Rectangle())
         .contextMenu {
-            if ProcessActions.webURL(for: entry) != nil {
-                Button("Open in Browser") { ProcessActions.openWeb(for: entry) }
+            if ProcessActions.webURL(for: service) != nil {
+                Button("Open in Browser") { ProcessActions.openWeb(for: service) }
                 Divider()
             }
-            Button("Copy \(entry.displayAddress):\(entry.port)") {
-                ProcessActions.copy("\(entry.displayAddress):\(entry.port)")
+            Button("Copy \(service.primaryAddress):\(service.port)") {
+                ProcessActions.copy("\(service.primaryAddress):\(service.port)")
             }
-            Button("Copy PID \(entry.pid)") {
-                ProcessActions.copy(String(entry.pid))
+            Button("Copy PID \(service.pid)") {
+                ProcessActions.copy(String(service.pid))
             }
             if let path = stats?.executablePath {
                 Button("Reveal Binary in Finder") {
@@ -168,16 +209,21 @@ private struct PortRow: View {
                     ProcessActions.copy(path)
                 }
             }
+            if let container {
+                Divider()
+                Button("Copy Container Name") { ProcessActions.copy(container.name) }
+                Button("Copy Image") { ProcessActions.copy(container.image) }
+            }
             Divider()
-            Button("Terminate \(entry.command) (SIGTERM)", role: .destructive) {
-                ProcessActions.terminate(pid: entry.pid)
+            Button("Terminate \(service.command) (SIGTERM)", role: .destructive) {
+                ProcessActions.terminate(pid: service.pid)
             }
         }
     }
 
     private var exposureBadge: some View {
         Group {
-            switch entry.exposure {
+            switch service.exposure {
             case .localhost:
                 Image(systemName: "lock.fill").foregroundStyle(.green)
             case .specific:
@@ -192,7 +238,7 @@ private struct PortRow: View {
     }
 
     private var exposureHelp: String {
-        switch entry.exposure {
+        switch service.exposure {
         case .localhost: return "Localhost only — not reachable off this machine"
         case .specific: return "Bound to a specific interface"
         case .allInterfaces: return "Exposed on all interfaces — reachable from the network"

@@ -20,22 +20,23 @@ enum ProcessActions {
     }
 
     /// Build an http(s) URL for a TCP service, or nil for UDP. Wildcard/localhost
-    /// binds open against `localhost`; a specific bind opens against that address.
-    static func webURL(for entry: PortEntry) -> URL? {
-        guard entry.proto == .tcp else { return nil }
+    /// binds open against `localhost`; a specific bind opens against that address
+    /// (the display address is already bracketed for IPv6).
+    static func webURL(for service: ServiceRow) -> URL? {
+        guard service.proto == .tcp else { return nil }
         let host: String
-        switch entry.exposure {
+        switch service.exposure {
         case .localhost, .allInterfaces:
             host = "localhost"
         case .specific:
-            host = entry.family == "IPv6" ? "[\(entry.address)]" : entry.address
+            host = service.displayAddresses.first ?? "localhost"
         }
-        let scheme = [443, 8443, 4443].contains(entry.port) ? "https" : "http"
-        return URL(string: "\(scheme)://\(host):\(entry.port)")
+        let scheme = [443, 8443, 4443].contains(service.port) ? "https" : "http"
+        return URL(string: "\(scheme)://\(host):\(service.port)")
     }
 
-    static func openWeb(for entry: PortEntry) {
-        guard let url = webURL(for: entry) else { return }
+    static func openWeb(for service: ServiceRow) {
+        guard let url = webURL(for: service) else { return }
         NSWorkspace.shared.open(url)
     }
 }
