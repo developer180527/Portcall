@@ -1,0 +1,39 @@
+# XcodeGen spec. Regenerate the project with:  xcodegen generate
+# The .xcodeproj is disposable/generated; this file is the source of truth.
+name: Portcall
+options:
+  bundleIdPrefix: com.local
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Ad-hoc "Sign to Run Locally" — no Apple Developer team needed.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    # No CODE_SIGN_ENTITLEMENTS => unsandboxed, so the app can spawn lsof
+    # and call kill(). Do NOT add App Sandbox or these break.
+
+targets:
+  Portcall:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/Portcall
+    info:
+      path: Info.plist
+      properties:
+        LSUIElement: true            # menu-bar only, no Dock icon
+        CFBundleDisplayName: Portcall
+        LSMinimumSystemVersion: "14.0"
+        NSHighResolutionCapable: true
+    settings:
+      base:
+        PRODUCT_NAME: Portcall
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.portcall
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
